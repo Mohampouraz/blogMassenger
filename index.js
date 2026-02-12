@@ -85,7 +85,6 @@ io.on('connection', (socket) => {
             socket.join('admin_room');
             socket.join(sessionId);
             
-            // دریافت لیست کاربران + تعداد پیام‌های ناخوانده (تغییر مهم)
             try {
                 const users = await pool.query(`
                     SELECT s.id, s.name, s.last_active,
@@ -144,12 +143,11 @@ io.on('connection', (socket) => {
                 socket.to('admin_room').emit('message_receive', payload);
             } else {
                 io.to('admin_room').emit('message_receive', payload);
-                // ارسال رویداد آپدیت لیست به ادمین (تغییر مهم برای رفرش آنی)
                 io.to('admin_room').emit('list_update', {
                     id: sessionId,
                     name: socket.data.name,
                     last_active: new Date(),
-                    increment_unread: true // سیگنال برای افزایش بالون
+                    increment_unread: true
                 });
             }
 
@@ -169,7 +167,6 @@ io.on('connection', (socket) => {
             io.to(sessionId).emit('msgs_seen_update');
             io.to('admin_room').emit('msgs_seen_update');
             
-            // اگر ادمین پیام‌ها را دید، به همه ادمین‌ها بگو که بالون را صفر کنند
             if (viewerIsAdmin) {
                 io.to('admin_room').emit('list_update', {
                     id: sessionId,
