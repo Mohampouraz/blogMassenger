@@ -37,8 +37,12 @@ async function initDB() {
                 session_id VARCHAR(100), 
                 is_admin BOOLEAN, 
                 text TEXT, 
+                reply_to_id INTEGER,
+                reply_to_text TEXT,
+                reply_to_sender VARCHAR(100),
                 is_read BOOLEAN DEFAULT FALSE, 
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (reply_to_id) REFERENCES p_messages(id)
             )
         `);
         client.release();
@@ -116,15 +120,28 @@ io.on('connection', (socket) => {
 
     // === 2. ارسال پیام ===
     socket.on('message', async (data) => {
-        const { sessionId, text, tempId } = data;
+        const { sessionId, text, tempId, reply_to_id } = data;
         const isSenderAdmin = socket.data.isAdmin;
 
         if (!text || !sessionId) return;
 
         try {
+            let replyToText = null;
+            let replyToSender = null;
+            if (reply_to_id) {
+                const replyRes = await pool.query(
+                    'SELECT text, is_admin FROM p_messages WHERE id = $1',
+                    [reply_to_id]
+                );
+                if (replyRes.rows.length > 0) {
+                    replyToText = replyRes.rows[0].text;
+                    replyToSender = replyRes.rows[0].is_admin ? 'ادمین' : 'کاربر';
+                }
+            }
+
             const res = await pool.query(
-                'INSERT INTO p_messages (session_id, is_admin, text) VALUES ($1, $2, $3) RETURNING id, created_at',
-                [sessionId, isSenderAdmin, text]
+                'INSERT INTO p_messages (session_id, is_admin, text, reply_to_id, reply_to_text, reply_to_sender) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at',
+                [sessionId, isSenderAdmin, text, reply_to_id || null, replyToText, replyToSender]
             );
 
             await pool.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [sessionId]);
@@ -136,6 +153,9 @@ io.on('connection', (socket) => {
                 isAdmin: isSenderAdmin,
                 is_read: false,
                 created_at: res.rows[0].created_at,
+                reply_to_id: reply_to_id || null,
+                reply_to_text: replyToText,
+                reply_to_sender: replyToSender,
                 tempId
             };
 
@@ -188,7 +208,9 @@ io.on('connection', (socket) => {
                 [sessionId, limit]
             );
             socket.emit('history_data', res.rows.map(m => ({
-                id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text, is_read: m.is_read, created_at: m.created_at
+                id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text, 
+                reply_to_id: m.reply_to_id, reply_to_text: m.reply_to_text, reply_to_sender: m.reply_to_sender,
+                is_read: m.is_read, created_at: m.created_at
             })));
         } catch (err) { console.error(err); }
     });
@@ -204,7 +226,9 @@ io.on('connection', (socket) => {
             );
             socket.emit('older_history_data', {
                 messages: res.rows.map(m => ({
-                    id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text, is_read: m.is_read, created_at: m.created_at
+                    id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text,
+                    reply_to_id: m.reply_to_id, reply_to_text: m.reply_to_text, reply_to_sender: m.reply_to_sender,
+                    is_read: m.is_read, created_at: m.created_at
                 }))
             });
         } catch (err) { console.error(err); }
