@@ -19,6 +19,7 @@ const pool = new Pool({
 });
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+console.log(ADMIN_PASSWORD);
 
 // ========== دیتابیس ==========
 async function initDB() {
