@@ -17,7 +17,8 @@ const client = new Client({
 async function initDB() {
   await client.connect();
   console.log('DB Connected');
-  // برای اعمال تغییرات دیتابیس، یکبار دو خط زیر را از کامنت خارج و دیپلوی کنید، سپس دوباره کامنت کنید
+  // یکبار برای پاکسازی دیتابیس قدیمی این دو خط را از کامنت خارج و دیپلوی کنید
+  // سپس دوباره کامنت کنید
   // await client.query('DROP TABLE IF EXISTS p_messages');
   // await client.query('DROP TABLE IF EXISTS sessions');
 
@@ -31,7 +32,6 @@ const ADMIN_NAME = "سیگار با ته‌چین ماست";
 
 io.on('connection', (socket) => {
   
-  // 1. احراز هویت و ورود به اتاق
   socket.on('auth', async ({ sessionId, inputName }) => {
     let isAdmin = false;
     let name = inputName;
@@ -47,8 +47,8 @@ io.on('connection', (socket) => {
     }
 
     if (!isAdmin) {
-      socket.join(sessionId); // کاربر حتما باید عضو اتاق خودش شود
-      // آپدیت نام کاربر در دیتابیس
+      socket.join(sessionId); 
+      // آپدیت نام کاربر
       await client.query('INSERT INTO sessions (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = $2, last_active = CURRENT_TIMESTAMP', [sessionId, name]);
       io.to('admin_room').emit('session_update', { id: sessionId, name, last_active: new Date() });
     }
@@ -56,7 +56,6 @@ io.on('connection', (socket) => {
     socket.emit('auth_success', { isAdmin, name });
   });
 
-  // 2. تغییر نام آنی (AJAX)
   socket.on('change_name', async ({ sessionId, newName, isAdmin }) => {
     if (!isAdmin) {
         await client.query('UPDATE sessions SET name = $1 WHERE id = $2', [newName, sessionId]);
@@ -65,34 +64,34 @@ io.on('connection', (socket) => {
     socket.emit('name_changed', newName);
   });
 
-  // 3. ارسال پیام
   socket.on('message', async ({ sessionId, text, isAdmin, tempId }) => {
     if (!text) return;
     const isRealAdmin = socket.rooms.has('admin_room');
-    if (isAdmin && !isRealAdmin) return; 
+    
+    // اگر کسی ادعای ادمینی کرد ولی در اتاق ادمین نبود، پیامش را کاربر عادی ثبت کن
+    const finalIsAdmin = (isAdmin && isRealAdmin);
 
-    // ذخیره
-    const res = await client.query('INSERT INTO p_messages (session_id, is_admin, text) VALUES ($1, $2, $3) RETURNING id', [sessionId, isRealAdmin, text]);
+    const res = await client.query('INSERT INTO p_messages (session_id, is_admin, text) VALUES ($1, $2, $3) RETURNING id', [sessionId, finalIsAdmin, text]);
     await client.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [sessionId]);
 
     const msgData = { 
       id: res.rows[0].id,
       sessionId, 
       text, 
-      isAdmin: isRealAdmin, 
+      isAdmin: finalIsAdmin, 
       is_read: false,
       created_at: new Date(),
-      tempId: tempId // شناسه موقت برای جلوگیری از تکرار در فرانت
+      tempId: tempId // شناسه موقت را برمی‌گردانیم تا فرانت بفهمد پیام خودش است
     };
 
-    // ارسال به همه (کاربر و ادمین)
+    // ارسال به اتاق کاربر
     io.to(sessionId).emit('message_receive', msgData);
+    // ارسال به اتاق ادمین
     io.to('admin_room').emit('message_receive', msgData);
     
-    if (!isRealAdmin) io.to('admin_room').emit('new_user_msg', msgData);
+    if (!finalIsAdmin) io.to('admin_room').emit('new_user_msg', msgData);
   });
 
-  // 4. تیک دوم (Seen)
   socket.on('mark_seen', async ({ sessionId, viewerIsAdmin }) => {
     await client.query(
       'UPDATE p_messages SET is_read = TRUE WHERE session_id = $1 AND is_admin = $2 AND is_read = FALSE',
@@ -105,7 +104,14 @@ io.on('connection', (socket) => {
   socket.on('get_history', async (sessionId) => {
     if (socket.rooms.has('admin_room') || socket.rooms.has(sessionId)) {
       const res = await client.query('SELECT * FROM p_messages WHERE session_id = $1 ORDER BY created_at ASC LIMIT 100', [sessionId]);
-      socket.emit('history_data', res.rows);
+      // تبدیل نام ستون‌های دیتابیس به نام‌های استاندارد فرانت
+      const rows = res.rows.map(r => ({
+          text: r.text,
+          isAdmin: r.is_admin,
+          is_read: r.is_read,
+          created_at: r.created_at
+      }));
+      socket.emit('history_data', rows);
     }
   });
 });
