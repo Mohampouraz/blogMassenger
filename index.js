@@ -8,7 +8,7 @@ const cors = require('cors');
 // 🔴 تنظیمات حیاتی:
 // برای پاکسازی دیتابیس این را true کنید و دیپلوی کنید.
 // بعد از پاکسازی، حتماً دوباره false کنید و دیپلوی کنید.
-const WIPE_DB_ON_START = true; 
+const WIPE_DB_ON_START = false; 
 // ---------------------------------------------------------
 
 const app = express();
