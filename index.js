@@ -17,7 +17,7 @@ const client = new Client({
 async function initDB() {
   await client.connect();
   console.log('DB Connected');
-  // فقط یکبار اجرا شود، بعدا این خطوط دراپ را کامنت کنید
+  // برای اعمال تغییرات دیتابیس، یکبار دو خط زیر را از کامنت خارج و دیپلوی کنید، سپس دوباره کامنت کنید
   // await client.query('DROP TABLE IF EXISTS p_messages');
   // await client.query('DROP TABLE IF EXISTS sessions');
 
@@ -27,9 +27,11 @@ async function initDB() {
 initDB();
 
 const ADMIN_PASS = process.env.ADMIN_PASSWORD || "12345";
-const ADMIN_NAME = "سیگار با ته‌چین ماست"; // نام ثابت مدیر
+const ADMIN_NAME = "سیگار با ته‌چین ماست";
 
 io.on('connection', (socket) => {
+  
+  // 1. احراز هویت و ورود به اتاق
   socket.on('auth', async ({ sessionId, inputName }) => {
     let isAdmin = false;
     let name = inputName;
@@ -45,7 +47,8 @@ io.on('connection', (socket) => {
     }
 
     if (!isAdmin) {
-      socket.join(sessionId);
+      socket.join(sessionId); // کاربر حتما باید عضو اتاق خودش شود
+      // آپدیت نام کاربر در دیتابیس
       await client.query('INSERT INTO sessions (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = $2, last_active = CURRENT_TIMESTAMP', [sessionId, name]);
       io.to('admin_room').emit('session_update', { id: sessionId, name, last_active: new Date() });
     }
@@ -53,12 +56,22 @@ io.on('connection', (socket) => {
     socket.emit('auth_success', { isAdmin, name });
   });
 
-  socket.on('message', async ({ sessionId, text, isAdmin }) => {
+  // 2. تغییر نام آنی (AJAX)
+  socket.on('change_name', async ({ sessionId, newName, isAdmin }) => {
+    if (!isAdmin) {
+        await client.query('UPDATE sessions SET name = $1 WHERE id = $2', [newName, sessionId]);
+        io.to('admin_room').emit('session_update', { id: sessionId, name: newName, last_active: new Date() });
+    }
+    socket.emit('name_changed', newName);
+  });
+
+  // 3. ارسال پیام
+  socket.on('message', async ({ sessionId, text, isAdmin, tempId }) => {
     if (!text) return;
     const isRealAdmin = socket.rooms.has('admin_room');
     if (isAdmin && !isRealAdmin) return; 
 
-    // ذخیره در دیتابیس
+    // ذخیره
     const res = await client.query('INSERT INTO p_messages (session_id, is_admin, text) VALUES ($1, $2, $3) RETURNING id', [sessionId, isRealAdmin, text]);
     await client.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [sessionId]);
 
@@ -66,18 +79,20 @@ io.on('connection', (socket) => {
       id: res.rows[0].id,
       sessionId, 
       text, 
-      isAdmin: isRealAdmin, // اینجا مقدار صحیح ارسال میشود
+      isAdmin: isRealAdmin, 
       is_read: false,
-      created_at: new Date() 
+      created_at: new Date(),
+      tempId: tempId // شناسه موقت برای جلوگیری از تکرار در فرانت
     };
 
-    // ارسال به همه (گوشی و ادمین)
+    // ارسال به همه (کاربر و ادمین)
     io.to(sessionId).emit('message_receive', msgData);
     io.to('admin_room').emit('message_receive', msgData);
     
     if (!isRealAdmin) io.to('admin_room').emit('new_user_msg', msgData);
   });
 
+  // 4. تیک دوم (Seen)
   socket.on('mark_seen', async ({ sessionId, viewerIsAdmin }) => {
     await client.query(
       'UPDATE p_messages SET is_read = TRUE WHERE session_id = $1 AND is_admin = $2 AND is_read = FALSE',
@@ -90,17 +105,7 @@ io.on('connection', (socket) => {
   socket.on('get_history', async (sessionId) => {
     if (socket.rooms.has('admin_room') || socket.rooms.has(sessionId)) {
       const res = await client.query('SELECT * FROM p_messages WHERE session_id = $1 ORDER BY created_at ASC LIMIT 100', [sessionId]);
-      
-      // *** اصلاح مهم: تبدیل فرمت دیتابیس به فرمت جاوااسکریپت ***
-      const formattedRows = res.rows.map(row => ({
-        id: row.id,
-        text: row.text,
-        isAdmin: row.is_admin, // نگاشت is_admin به isAdmin
-        is_read: row.is_read, // نگاشت is_read
-        created_at: row.created_at
-      }));
-      
-      socket.emit('history_data', formattedRows);
+      socket.emit('history_data', res.rows);
     }
   });
 });
