@@ -103,6 +103,8 @@ io.on('connection', (socket) => {
                     'INSERT INTO sessions (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = $2, last_active = CURRENT_TIMESTAMP',
                     [sessionId, name]
                 );
+                // Load initial history for user
+                socket.emit('get_history', { sessionId, limit: 50 });
             } catch (err) {
                 console.error("Error saving session:", err);
             }
@@ -177,12 +179,13 @@ io.on('connection', (socket) => {
     });
 
     // === 4. تاریخچه ===
-    socket.on('get_history', async (sessionId) => {
-        if (!socket.data.isAdmin && socket.data.sessionId !== sessionId) return;
+    socket.on('get_history', async (data) => {
+        const { sessionId, limit = 50 } = data || {};
+        if (!sessionId || (!socket.data.isAdmin && socket.data.sessionId !== sessionId)) return;
         try {
             const res = await pool.query(
-                'SELECT * FROM p_messages WHERE session_id = $1 ORDER BY created_at ASC LIMIT 100',
-                [sessionId]
+                'SELECT * FROM p_messages WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2',
+                [sessionId, limit]
             );
             socket.emit('history_data', res.rows.map(m => ({
                 id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text, is_read: m.is_read, created_at: m.created_at
@@ -190,7 +193,24 @@ io.on('connection', (socket) => {
         } catch (err) { console.error(err); }
     });
 
-    // === 5. تایپینگ ===
+    // === 5. بارگذاری پیام‌های قدیمی‌تر ===
+    socket.on('get_older_history', async (data) => {
+        const { sessionId, before, limit = 20 } = data || {};
+        if (!sessionId || !before || (!socket.data.isAdmin && socket.data.sessionId !== sessionId)) return;
+        try {
+            const res = await pool.query(
+                'SELECT * FROM p_messages WHERE session_id = $1 AND created_at < $2 ORDER BY created_at DESC LIMIT $3',
+                [sessionId, before, limit]
+            );
+            socket.emit('older_history_data', {
+                messages: res.rows.map(m => ({
+                    id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text, is_read: m.is_read, created_at: m.created_at
+                }))
+            });
+        } catch (err) { console.error(err); }
+    });
+
+    // === 6. تایپینگ ===
     socket.on('typing', (data) => {
         const sessionId = data.sessionId || socket.data.sessionId;
         const isAdmin = socket.data.isAdmin;
