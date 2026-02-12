@@ -60,7 +60,7 @@ io.use(async (socket, next) => {
         isAdmin: false,
         name: "کاربر"
     };
-
+    console.log(token);
     // بررسی ادمین بودن
     if (token && token.startsWith("admin:")) {
         const pass = token.split("admin:")[1];
