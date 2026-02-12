@@ -1,8 +1,8 @@
-require('dotenv').config(); // بارگذاری متغیرهای محیطی
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
-const { Pool } = require('pg'); // استفاده از Pool به جای Client
+const { Pool } = require('pg');
 const cors = require('cors');
 
 const app = express();
@@ -11,18 +11,18 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: "*", // در محیط پروداکشن بهتر است آدرس وبلاگ خود را بگذارید
+        origin: "*",
         methods: ["GET", "POST"]
     }
 });
 
-// اتصال به دیتابیس با استفاده از Pool (پایدارتر)
+// اتصال به دیتابیس
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false } // برای Render و Heroku الزامی است
+    ssl: { rejectUnauthorized: false }
 });
 
-// رمز عبور ادمین از متغیرهای محیطی خوانده می‌شود
+// رمز عبور ادمین از متغیر محیطی (Environment Variable)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD; 
 
 async function initDB() {
@@ -30,6 +30,7 @@ async function initDB() {
         const client = await pool.connect();
         console.log('DB Connected Successfully');
         
+        // ایجاد جدول نشست‌ها
         await client.query(`
             CREATE TABLE IF NOT EXISTS sessions (
                 id VARCHAR(100) PRIMARY KEY, 
@@ -38,6 +39,7 @@ async function initDB() {
             )
         `);
         
+        // ایجاد جدول پیام‌ها
         await client.query(`
             CREATE TABLE IF NOT EXISTS p_messages (
                 id SERIAL PRIMARY KEY, 
@@ -57,23 +59,23 @@ initDB();
 
 io.on('connection', (socket) => {
     
-    // 1. احراز هویت
+    // 1. احراز هویت (Login/Auth)
     socket.on('auth', async ({ sessionId, inputName }) => {
         let isAdmin = false;
         let finalName = inputName;
 
-        // بررسی اینکه آیا کاربر قصد ورود به عنوان ادمین را دارد؟
+        // بررسی اینکه آیا کاربر ادمین است؟ (فرمت ورودی: admin:PASSWORD)
         if (inputName && inputName.startsWith("admin:")) {
             const providedPass = inputName.split("admin:")[1];
             
-            // چک کردن رمز عبور با متغیر محیطی
             if (providedPass === ADMIN_PASSWORD) {
                 isAdmin = true;
-                finalName = "سیگار با ته‌چین ماست"; // نام نمایشی ادمین
+                finalName = "سیگار با ته‌چین ماست";
                 socket.join('admin_room');
                 console.log("Admin connected!");
                 
-                // ارسال لیست کاربران اخیر برای ادمین
+                // ارسال لیست کاربران (مرتب شده بر اساس آخرین فعالیت)
+                // این باعث می‌شود کاربر جدید همیشه در بالا باشد
                 try {
                     const result = await pool.query('SELECT * FROM sessions ORDER BY last_active DESC LIMIT 50');
                     socket.emit('admin_inbox', result.rows);
@@ -84,21 +86,21 @@ io.on('connection', (socket) => {
         if (!isAdmin) {
             // کاربر معمولی
             socket.join(sessionId); 
-            // اگر نام معتبر بود، در دیتابیس بروزرسانی کن
+            // بروزرسانی نام و زمان فعالیت در دیتابیس
             if (finalName && !finalName.startsWith("admin:")) {
                 try {
                     await pool.query(
                         'INSERT INTO sessions (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = $2, last_active = CURRENT_TIMESTAMP',
                         [sessionId, finalName]
                     );
-                    // خبر دادن به ادمین که کاربر فعال شد
+                    // خبر دادن به ادمین که کاربری آنلاین شد
                     io.to('admin_room').emit('session_update', { id: sessionId, name: finalName, last_active: new Date() });
                 } catch (e) { console.error(e); }
             }
         }
 
-        // نتیجه را به کلاینت برمی‌گردانیم
-        socket.emit('auth_success', { isAdmin, name: finalName });
+        // نتیجه احراز هویت را به کلاینت برمی‌گردانیم
+        socket.emit('auth_success', { isAdmin, name: finalName, sessionId: sessionId });
     });
 
     // 2. تغییر نام کاربر
@@ -106,20 +108,27 @@ io.on('connection', (socket) => {
         if (!isAdmin) {
             try {
                 await pool.query('UPDATE sessions SET name = $1 WHERE id = $2', [newName, sessionId]);
+                // آپدیت کردن لیست ادمین
                 io.to('admin_room').emit('session_update', { id: sessionId, name: newName, last_active: new Date() });
                 socket.emit('name_changed', newName);
             } catch (e) { console.error(e); }
         }
     });
 
-    // 3. ارسال پیام
+    // 3. دریافت و ارسال پیام (بخش حیاتی)
     socket.on('message', async (data) => {
         const { sessionId, text, tempId } = data;
-        // نکته: ما isAdmin را از دیتای کلاینت نمی‌گیریم چون قابل جعل است.
-        // چک می‌کنیم آیا این سوکت واقعا در اتاق ادمین هست یا نه.
+        
+        // بررسی امنیتی: آیا فرستنده واقعاً در اتاق ادمین است؟
         const isSenderAdmin = socket.rooms.has('admin_room');
 
         if (!text || !sessionId) return;
+
+        // اصلاح مهم: اگر فرستنده کاربر است، مطمئن شو که در اتاق خودش عضو است
+        // این خط مشکل "عدم دریافت پاسخ" را حل می‌کند اگر سوکت قطع و وصل شده باشد
+        if (!isSenderAdmin) {
+             socket.join(sessionId);
+        }
 
         try {
             // ذخیره در دیتابیس
@@ -128,7 +137,7 @@ io.on('connection', (socket) => {
                 [sessionId, isSenderAdmin, text]
             );
 
-            // بروزرسانی زمان آخرین فعالیت کاربر
+            // بروزرسانی زمان آخرین فعالیت (تا کاربر بیاید بالای لیست ادمین)
             await pool.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [sessionId]);
 
             const msgPayload = { 
@@ -141,15 +150,26 @@ io.on('connection', (socket) => {
                 tempId: tempId
             };
 
-            // **اصلاح مهم:** ارسال پیام
-            // ۱. ارسال به خود کاربر (چه گیرنده باشد چه فرستنده)
+            // الف) ارسال به اتاق کاربر (چه خودش فرستاده باشد چه ادمین)
             io.to(sessionId).emit('message_receive', msgPayload);
             
-            // ۲. ارسال به ادمین (تا در پنل ادمین هم دیده شود)
+            // ب) ارسال به اتاق ادمین (تا ادمین همیشه همه پیام‌ها را ببیند)
             io.to('admin_room').emit('message_receive', msgPayload);
 
-            // اگر فرستنده کاربر بود، یک نوتیفیکیشن خاص به ادمین بده تا لیستش آپدیت شود
+            // ج) اگر پیام از سمت کاربر بود، به ادمین بگو لیستش را رفرش کند
             if (!isSenderAdmin) {
+                // ارسال کل آبجکت نشست برای آپدیت لیست
+                // ما نام کاربر را هم دوباره می‌گیریم تا لیست دقیق باشد
+                const userQuery = await pool.query('SELECT name FROM sessions WHERE id = $1', [sessionId]);
+                const userName = userQuery.rows.length > 0 ? userQuery.rows[0].name : "کاربر";
+                
+                io.to('admin_room').emit('session_update', { 
+                    id: sessionId, 
+                    name: userName, 
+                    last_active: new Date(),
+                    last_msg: text // برای نمایش پیش‌نمایش پیام (اختیاری)
+                });
+                
                 io.to('admin_room').emit('new_user_msg', msgPayload);
             }
 
@@ -158,27 +178,27 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 4. سین کردن پیام‌ها
+    // 4. سین کردن پیام‌ها (تیک دوم)
     socket.on('mark_seen', async ({ sessionId, viewerIsAdmin }) => {
         try {
-            // اگر ادمین دیده، پیام‌های کاربر (is_admin=false) سین می‌شوند
-            // اگر کاربر دیده، پیام‌های ادمین (is_admin=true) سین می‌شوند
-            const targetIsAdminMsg = !viewerIsAdmin; 
+            // اگر بیننده ادمین است، پیام‌های کاربر باید سین شوند
+            // اگر بیننده کاربر است، پیام‌های ادمین باید سین شوند
+            const targetMsgIsAdmin = !viewerIsAdmin; 
             
             await pool.query(
                 'UPDATE p_messages SET is_read = TRUE WHERE session_id = $1 AND is_admin = $2 AND is_read = FALSE',
-                [sessionId, targetIsAdminMsg]
+                [sessionId, targetMsgIsAdmin]
             );
 
-            // اطلاع‌رسانی به هر دو طرف که تیک دوم بخورد
+            // اطلاع‌رسانی به هر دو طرف
             io.to(sessionId).emit('msgs_seen_update');
             io.to('admin_room').emit('msgs_seen_update');
         } catch (e) { console.error(e); }
     });
 
-    // 5. دریافت تاریخچه
+    // 5. دریافت تاریخچه پیام‌ها
     socket.on('get_history', async (targetSessionId) => {
-        // فقط ادمین یا صاحب سشن حق دسترسی دارند
+        // فقط ادمین یا خود صاحب نشست حق دیدن تاریخچه را دارند
         if (socket.rooms.has('admin_room') || socket.rooms.has(targetSessionId)) {
             try {
                 const res = await pool.query(
@@ -186,7 +206,6 @@ io.on('connection', (socket) => {
                     [targetSessionId]
                 );
                 
-                // فرمت‌دهی برای فرانت
                 const rows = res.rows.map(r => ({
                     text: r.text,
                     isAdmin: r.is_admin,
