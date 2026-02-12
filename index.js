@@ -17,77 +17,88 @@ const client = new Client({
 async function initDB() {
   await client.connect();
   console.log('DB Connected');
-  // ساخت جداول (اگر وجود ندارند)
-  await client.query(`CREATE TABLE IF NOT EXISTS sessions (id VARCHAR(100) PRIMARY KEY, name VARCHAR(100), last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-  await client.query(`CREATE TABLE IF NOT EXISTS p_messages (id SERIAL PRIMARY KEY, session_id VARCHAR(100), is_admin BOOLEAN, text TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+  
+  // برای اعمال تغییرات جدید، جداول قبلی را پاک میکنیم
+  await client.query('DROP TABLE IF EXISTS p_messages');
+  await client.query('DROP TABLE IF EXISTS sessions');
+  
+  await client.query(`CREATE TABLE sessions (id VARCHAR(100) PRIMARY KEY, name VARCHAR(100), last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+  // اضافه شدن ستون is_read
+  await client.query(`CREATE TABLE p_messages (id SERIAL PRIMARY KEY, session_id VARCHAR(100), is_admin BOOLEAN, text TEXT, is_read BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+  console.log('Tables Updated with Read Status');
 }
 initDB();
 
 const ADMIN_PASS = process.env.ADMIN_PASSWORD || "12345";
 
 io.on('connection', (socket) => {
-  // 1. ورود و تعیین نقش
   socket.on('auth', async ({ sessionId, inputName }) => {
     let isAdmin = false;
     let name = inputName;
 
-    // تشخیص مدیر
     if (inputName && inputName.startsWith("admin:")) {
       if (inputName.split(":")[1] === ADMIN_PASS) {
         isAdmin = true;
         name = "سیگار با ته‌چین ماست";
-        socket.join('admin_room'); // عضویت در اتاق مدیران
-        
-        // ارسال لیست آخرین کاربران به مدیر
+        socket.join('admin_room');
         const users = await client.query('SELECT * FROM sessions ORDER BY last_active DESC LIMIT 50');
         socket.emit('admin_inbox', users.rows);
       }
     }
 
     if (!isAdmin) {
-      socket.join(sessionId); // عضویت در اتاق اختصاصی کاربر
-      // ذخیره نام کاربر
+      socket.join(sessionId);
       await client.query('INSERT INTO sessions (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = $2, last_active = CURRENT_TIMESTAMP', [sessionId, name]);
-      // اطلاع به مدیر که کاربری آنلاین شد
       io.to('admin_room').emit('session_update', { id: sessionId, name, last_active: new Date() });
     }
 
     socket.emit('auth_success', { isAdmin, name });
   });
 
-  // 2. دریافت و پخش پیام
   socket.on('message', async ({ sessionId, text, isAdmin }) => {
     if (!text) return;
+    const isRealAdmin = socket.rooms.has('admin_room');
+    if (isAdmin && !isRealAdmin) return; 
 
-    // ذخیره در دیتابیس
-    await client.query('INSERT INTO p_messages (session_id, is_admin, text) VALUES ($1, $2, $3)', [sessionId, isAdmin, text]);
+    // ذخیره پیام
+    const res = await client.query('INSERT INTO p_messages (session_id, is_admin, text) VALUES ($1, $2, $3) RETURNING id', [sessionId, isRealAdmin, text]);
     await client.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [sessionId]);
 
     const msgData = { 
+      id: res.rows[0].id,
       sessionId, 
       text, 
-      isAdmin, 
+      isAdmin: isRealAdmin, 
+      is_read: false,
       created_at: new Date() 
     };
 
-    // *** تغییر مهم: ارسال اجباری به هر دو طرف ***
-    
-    // الف) ارسال به اتاق کاربر (خود کاربر و اگر ادمین جوین شده باشد)
     io.to(sessionId).emit('message_receive', msgData);
-
-    // ب) ارسال به اتاق مدیریت (برای نوتیفیکیشن و آپدیت زنده)
     io.to('admin_room').emit('message_receive', msgData);
     
-    // ج) اگر پیام از طرف کاربر است، لیست اینباکس مدیر را رفرش کن
-    if (!isAdmin) {
-        io.to('admin_room').emit('new_user_msg', msgData);
-    }
+    if (!isRealAdmin) io.to('admin_room').emit('new_user_msg', msgData);
   });
 
-  // 3. دریافت تاریخچه
+  // رویداد جدید: خوانده شدن پیام
+  socket.on('mark_seen', async ({ sessionId, viewerIsAdmin }) => {
+    // تمام پیام‌هایی که طرف مقابل فرستاده و خوانده نشده را تیک بزن
+    // اگر بیننده ادمین است -> پیام‌های کاربر خوانده شود
+    // اگر بیننده کاربر است -> پیام‌های ادمین خوانده شود
+    await client.query(
+      'UPDATE p_messages SET is_read = TRUE WHERE session_id = $1 AND is_admin = $2 AND is_read = FALSE',
+      [sessionId, !viewerIsAdmin]
+    );
+
+    // به همه خبر بده که پیام‌های این سشن خوانده شد
+    io.to(sessionId).emit('msgs_seen_update');
+    io.to('admin_room').emit('msgs_seen_update', { sessionId });
+  });
+
   socket.on('get_history', async (sessionId) => {
+    if (socket.rooms.has('admin_room') || socket.rooms.has(sessionId)) {
       const res = await client.query('SELECT * FROM p_messages WHERE session_id = $1 ORDER BY created_at ASC LIMIT 100', [sessionId]);
       socket.emit('history_data', res.rows);
+    }
   });
 });
 
