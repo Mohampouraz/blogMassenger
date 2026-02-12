@@ -19,7 +19,6 @@ const pool = new Pool({
 });
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-console.log(ADMIN_PASSWORD);
 
 // ========== دیتابیس ==========
 async function initDB() {
@@ -54,17 +53,17 @@ initDB();
 io.use(async (socket, next) => {
     const { sessionId, token, inputName } = socket.handshake.auth;
     
-    // ذخیره اطلاعات در socket.data
+    // ذخیره اطلاعات اولیه در socket.data
     socket.data = {
         sessionId: null,
         isAdmin: false,
         name: "کاربر"
     };
-    console.log(token);
+
     // بررسی ادمین بودن
     if (token && token.startsWith("admin:")) {
         const pass = token.split("admin:")[1];
-        console.log("AUTH PASS =",pass);
+        // مقایسه دقیق رمز عبور (بهتر است فضای خالی احتمالی حذف شود اگر نیاز باشد)
         if (pass === ADMIN_PASSWORD) {
             socket.data.isAdmin = true;
             socket.data.name = "سیگار با ته‌چین ماست";
@@ -174,7 +173,7 @@ io.on('connection', (socket) => {
 
             // ارسال به ادمین‌ها
             if (isSenderAdmin) {
-                // اگر فرستنده ادمین است، به بقیه ادمین‌ها ارسال کن (نه به خودش)
+                // اگر فرستنده ادمین است، به بقیه ادمین‌ها هم ارسال کن
                 socket.to('admin_room').emit('message_receive', payload);
             } else {
                 // اگر فرستنده کاربر است، به همه ادمین‌ها ارسال کن
@@ -240,7 +239,34 @@ io.on('connection', (socket) => {
         }
     });
 
-    // === 5. قطع اتصال ===
+    // === 5. تایپ کردن (جدید) ===
+    socket.on('typing', (data) => {
+        const sessionId = data.sessionId || socket.data.sessionId;
+        const isAdmin = socket.data.isAdmin;
+
+        if (isAdmin) {
+            // ادمین تایپ می‌کند -> ارسال به کاربر خاص
+            socket.to(sessionId).emit('typing', { sessionId, isAdmin: true });
+        } else {
+            // کاربر تایپ می‌کند -> ارسال به همه ادمین‌ها
+            socket.to('admin_room').emit('typing', { sessionId, isAdmin: false });
+        }
+    });
+
+    socket.on('stop_typing', (data) => {
+        const sessionId = data.sessionId || socket.data.sessionId;
+        const isAdmin = socket.data.isAdmin;
+
+        if (isAdmin) {
+            // ادمین توقف تایپ -> ارسال به کاربر خاص
+            socket.to(sessionId).emit('stop_typing', { sessionId, isAdmin: true });
+        } else {
+            // کاربر توقف تایپ -> ارسال به همه ادمین‌ها
+            socket.to('admin_room').emit('stop_typing', { sessionId, isAdmin: false });
+        }
+    });
+
+    // === 6. قطع اتصال ===
     socket.on('disconnect', async () => {
         console.log(`🔌 Disconnected: ${socket.id} | Admin: ${socket.data.isAdmin}`);
         
@@ -257,7 +283,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // === 6. خطاهای عمومی ===
+    // === 7. خطاهای عمومی ===
     socket.on('error', (error) => {
         console.error(`Socket error for ${socket.id}:`, error);
     });
