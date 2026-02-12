@@ -64,6 +64,7 @@ io.use(async (socket, next) => {
     // بررسی ادمین بودن
     if (token && token.startsWith("admin:")) {
         const pass = token.split("admin:")[1];
+        console.log("AUTH PASS =",pass);
         if (pass === ADMIN_PASSWORD) {
             socket.data.isAdmin = true;
             socket.data.name = "سیگار با ته‌چین ماست";
