@@ -53,17 +53,10 @@ initDB();
 io.use(async (socket, next) => {
     const { sessionId, token, inputName } = socket.handshake.auth;
     
-    // ذخیره اطلاعات اولیه در socket.data
-    socket.data = {
-        sessionId: null,
-        isAdmin: false,
-        name: "کاربر"
-    };
+    socket.data = { sessionId: null, isAdmin: false, name: "کاربر" };
 
-    // بررسی ادمین بودن
     if (token && token.startsWith("admin:")) {
         const pass = token.split("admin:")[1];
-        // مقایسه دقیق رمز عبور (بهتر است فضای خالی احتمالی حذف شود اگر نیاز باشد)
         if (pass === ADMIN_PASSWORD) {
             socket.data.isAdmin = true;
             socket.data.name = "سیگار با ته‌چین ماست";
@@ -72,7 +65,6 @@ io.use(async (socket, next) => {
         }
     }
 
-    // بررسی کاربر عادی
     if (sessionId) {
         socket.data.sessionId = sessionId;
         socket.data.name = inputName || "کاربر";
@@ -85,53 +77,39 @@ io.use(async (socket, next) => {
 
 // ========== رویدادهای Socket ==========
 io.on('connection', (socket) => {
-    console.log(`🔌 New connection: ${socket.id} | Admin: ${socket.data.isAdmin} | Session: ${socket.data.sessionId}`);
-
-    // === 1. احراز هویت نهایی و جوین اتاق‌ها ===
+    // === 1. احراز هویت ===
     const handleAuth = async () => {
         const { sessionId, isAdmin, name } = socket.data;
 
         if (isAdmin) {
-            // ادمین به همه اتاق‌ها جوین می‌شود
             socket.join('admin_room');
             socket.join(sessionId);
             
-            // ارسال لیست کاربران به ادمین
+            // دریافت لیست کاربران + تعداد پیام‌های ناخوانده (تغییر مهم)
             try {
-                const users = await pool.query(
-                    'SELECT * FROM sessions ORDER BY last_active DESC LIMIT 50'
-                );
+                const users = await pool.query(`
+                    SELECT s.id, s.name, s.last_active,
+                    (SELECT COUNT(*)::int FROM p_messages m WHERE m.session_id = s.id AND m.is_admin = FALSE AND m.is_read = FALSE) as unread_count
+                    FROM sessions s
+                    ORDER BY last_active DESC LIMIT 50
+                `);
                 socket.emit('admin_inbox', users.rows);
             } catch (err) {
                 console.error("Error fetching users:", err);
             }
         } else {
-            // کاربر فقط به اتاق خودش جوین می‌شود
             socket.join(sessionId);
-            
-            // ذخیره یا بروزرسانی کاربر در دیتابیس
             try {
                 await pool.query(
                     'INSERT INTO sessions (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = $2, last_active = CURRENT_TIMESTAMP',
                     [sessionId, name]
                 );
-                // اطلاع به ادمین برای بروزرسانی لیست
-                io.to('admin_room').emit('session_update', { 
-                    id: sessionId, 
-                    name, 
-                    last_active: new Date() 
-                });
             } catch (err) {
                 console.error("Error saving session:", err);
             }
         }
 
-        // ارسال تاییدیه به کلاینت
-        socket.emit('auth_success', { 
-            isAdmin, 
-            name, 
-            sessionId 
-        });
+        socket.emit('auth_success', { isAdmin, name, sessionId });
     };
     handleAuth();
 
@@ -140,23 +118,15 @@ io.on('connection', (socket) => {
         const { sessionId, text, tempId } = data;
         const isSenderAdmin = socket.data.isAdmin;
 
-        if (!text || !sessionId) {
-            socket.emit('error', { message: 'متن پیام یا شناسه جلسه نامعتبر است' });
-            return;
-        }
+        if (!text || !sessionId) return;
 
         try {
-            // ذخیره در دیتابیس
             const res = await pool.query(
                 'INSERT INTO p_messages (session_id, is_admin, text) VALUES ($1, $2, $3) RETURNING id, created_at',
                 [sessionId, isSenderAdmin, text]
             );
 
-            // بروزرسانی زمان آخرین فعالیت
-            await pool.query(
-                'UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1',
-                [sessionId]
-            );
+            await pool.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [sessionId]);
 
             const payload = {
                 id: res.rows[0].id,
@@ -168,130 +138,84 @@ io.on('connection', (socket) => {
                 tempId
             };
 
-            // ارسال به کاربر مورد نظر (اتاق sessionId)
             io.to(sessionId).emit('message_receive', payload);
 
-            // ارسال به ادمین‌ها
             if (isSenderAdmin) {
-                // اگر فرستنده ادمین است، به بقیه ادمین‌ها هم ارسال کن
                 socket.to('admin_room').emit('message_receive', payload);
             } else {
-                // اگر فرستنده کاربر است، به همه ادمین‌ها ارسال کن
                 io.to('admin_room').emit('message_receive', payload);
-                io.to('admin_room').emit('new_user_msg', payload);
+                // ارسال رویداد آپدیت لیست به ادمین (تغییر مهم برای رفرش آنی)
+                io.to('admin_room').emit('list_update', {
+                    id: sessionId,
+                    name: socket.data.name,
+                    last_active: new Date(),
+                    increment_unread: true // سیگنال برای افزایش بالون
+                });
             }
 
         } catch (err) {
             console.error("Error sending message:", err);
-            socket.emit('error', { message: 'خطا در ارسال پیام' });
         }
     });
 
-    // === 3. دیده شدن پیام‌ها ===
+    // === 3. دیده شدن پیام ===
     socket.on('mark_seen', async ({ sessionId, viewerIsAdmin }) => {
         try {
             const targetIsAdmin = !viewerIsAdmin;
-            
             await pool.query(
                 'UPDATE p_messages SET is_read = TRUE WHERE session_id = $1 AND is_admin = $2 AND is_read = FALSE',
                 [sessionId, targetIsAdmin]
             );
-
-            // اطلاع به کاربر
             io.to(sessionId).emit('msgs_seen_update');
-            
-            // اطلاع به ادمین
             io.to('admin_room').emit('msgs_seen_update');
             
-        } catch (err) {
-            console.error("Error marking messages as seen:", err);
-        }
+            // اگر ادمین پیام‌ها را دید، به همه ادمین‌ها بگو که بالون را صفر کنند
+            if (viewerIsAdmin) {
+                io.to('admin_room').emit('list_update', {
+                    id: sessionId,
+                    reset_unread: true
+                });
+            }
+        } catch (err) { console.error(err); }
     });
 
-    // === 4. دریافت تاریخچه پیام‌ها ===
+    // === 4. تاریخچه ===
     socket.on('get_history', async (sessionId) => {
-        // بررسی دسترسی: ادمین یا صاحب جلسه
-        if (!socket.data.isAdmin && socket.data.sessionId !== sessionId) {
-            socket.emit('error', { message: 'دسترسی غیرمجاز' });
-            return;
-        }
-
+        if (!socket.data.isAdmin && socket.data.sessionId !== sessionId) return;
         try {
             const res = await pool.query(
                 'SELECT * FROM p_messages WHERE session_id = $1 ORDER BY created_at ASC LIMIT 100',
                 [sessionId]
             );
-
-            const messages = res.rows.map(msg => ({
-                id: msg.id,
-                sessionId: msg.session_id,
-                isAdmin: msg.is_admin,
-                text: msg.text,
-                is_read: msg.is_read,
-                created_at: msg.created_at
-            }));
-
-            socket.emit('history_data', messages);
-            
-        } catch (err) {
-            console.error("Error fetching history:", err);
-            socket.emit('error', { message: 'خطا در دریافت تاریخچه' });
-        }
+            socket.emit('history_data', res.rows.map(m => ({
+                id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text, is_read: m.is_read, created_at: m.created_at
+            })));
+        } catch (err) { console.error(err); }
     });
 
-    // === 5. تایپ کردن (جدید) ===
+    // === 5. تایپینگ ===
     socket.on('typing', (data) => {
         const sessionId = data.sessionId || socket.data.sessionId;
         const isAdmin = socket.data.isAdmin;
-
-        if (isAdmin) {
-            // ادمین تایپ می‌کند -> ارسال به کاربر خاص
-            socket.to(sessionId).emit('typing', { sessionId, isAdmin: true });
-        } else {
-            // کاربر تایپ می‌کند -> ارسال به همه ادمین‌ها
-            socket.to('admin_room').emit('typing', { sessionId, isAdmin: false });
-        }
+        if (isAdmin) socket.to(sessionId).emit('typing', { sessionId, isAdmin: true });
+        else socket.to('admin_room').emit('typing', { sessionId, isAdmin: false });
     });
 
     socket.on('stop_typing', (data) => {
         const sessionId = data.sessionId || socket.data.sessionId;
         const isAdmin = socket.data.isAdmin;
-
-        if (isAdmin) {
-            // ادمین توقف تایپ -> ارسال به کاربر خاص
-            socket.to(sessionId).emit('stop_typing', { sessionId, isAdmin: true });
-        } else {
-            // کاربر توقف تایپ -> ارسال به همه ادمین‌ها
-            socket.to('admin_room').emit('stop_typing', { sessionId, isAdmin: false });
-        }
+        if (isAdmin) socket.to(sessionId).emit('stop_typing', { sessionId, isAdmin: true });
+        else socket.to('admin_room').emit('stop_typing', { sessionId, isAdmin: false });
     });
 
-    // === 6. قطع اتصال ===
     socket.on('disconnect', async () => {
-        console.log(`🔌 Disconnected: ${socket.id} | Admin: ${socket.data.isAdmin}`);
-        
-        // اگر کاربر عادی بود، زمان آخرین فعالیت را بروز کن
         if (!socket.data.isAdmin && socket.data.sessionId) {
-            try {
-                await pool.query(
-                    'UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1',
-                    [socket.data.sessionId]
-                );
-            } catch (err) {
-                console.error("Error updating last_active:", err);
-            }
+            await pool.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [socket.data.sessionId]);
         }
-    });
-
-    // === 7. خطاهای عمومی ===
-    socket.on('error', (error) => {
-        console.error(`Socket error for ${socket.id}:`, error);
     });
 });
 
-// ========== راه‌اندازی سرور ==========
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📝 Admin password: ${ADMIN_PASSWORD ? '✅ Set' : '❌ Not set'}`);
 });
