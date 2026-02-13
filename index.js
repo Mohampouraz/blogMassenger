@@ -37,12 +37,19 @@ async function initDB() {
                 session_id VARCHAR(100), 
                 is_admin BOOLEAN, 
                 text TEXT, 
-                reply_to_id INTEGER,
-                reply_to_text TEXT,
-                reply_to_sender VARCHAR(100),
                 is_read BOOLEAN DEFAULT FALSE, 
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (reply_to_id) REFERENCES p_messages(id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS message_replies (
+                id SERIAL PRIMARY KEY,
+                message_id INTEGER REFERENCES p_messages(id) ON DELETE CASCADE,
+                reply_to_id INTEGER REFERENCES p_messages(id) ON DELETE CASCADE,
+                reply_text TEXT,
+                reply_is_admin BOOLEAN,
+                reply_created_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
         client.release();
@@ -118,46 +125,60 @@ io.on('connection', (socket) => {
     };
     handleAuth();
 
-    // === 2. ارسال پیام ===
+    // === 2. ارسال پیام با پشتیبانی از ریپلای ===
     socket.on('message', async (data) => {
-        const { sessionId, text, tempId, reply_to_id } = data;
+        const { sessionId, text, tempId, replyTo } = data;
         const isSenderAdmin = socket.data.isAdmin;
 
         if (!text || !sessionId) return;
 
         try {
-            let replyToText = null;
-            let replyToSender = null;
-            if (reply_to_id) {
-                const replyRes = await pool.query(
-                    'SELECT text, is_admin FROM p_messages WHERE id = $1',
-                    [reply_to_id]
-                );
-                if (replyRes.rows.length > 0) {
-                    replyToText = replyRes.rows[0].text;
-                    replyToSender = replyRes.rows[0].is_admin ? 'ادمین' : 'کاربر';
-                }
-            }
-
             const res = await pool.query(
-                'INSERT INTO p_messages (session_id, is_admin, text, reply_to_id, reply_to_text, reply_to_sender) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at',
-                [sessionId, isSenderAdmin, text, reply_to_id || null, replyToText, replyToSender]
+                'INSERT INTO p_messages (session_id, is_admin, text) VALUES ($1, $2, $3) RETURNING id, created_at',
+                [sessionId, isSenderAdmin, text]
             );
+
+            const messageId = res.rows[0].id;
+            const createdAt = res.rows[0].created_at;
 
             await pool.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [sessionId]);
 
             const payload = {
-                id: res.rows[0].id,
+                id: messageId,
                 sessionId,
                 text,
                 isAdmin: isSenderAdmin,
                 is_read: false,
-                created_at: res.rows[0].created_at,
-                reply_to_id: reply_to_id || null,
-                reply_to_text: replyToText,
-                reply_to_sender: replyToSender,
+                created_at: createdAt,
                 tempId
             };
+
+            // اگر پیام ریپلای دارد، اطلاعات ریپلای را ذخیره کن
+            if (replyTo) {
+                try {
+                    // ابتدا آیدی پیام اصلی را پیدا کن
+                    const findOriginalMsg = await pool.query(
+                        'SELECT id FROM p_messages WHERE session_id = $1 AND text LIKE $2 AND created_at = $3',
+                        [sessionId, replyTo.text, replyTo.time]
+                    );
+                    
+                    if (findOriginalMsg.rows.length > 0) {
+                        const replyToId = findOriginalMsg.rows[0].id;
+                        await pool.query(
+                            'INSERT INTO message_replies (message_id, reply_to_id, reply_text, reply_is_admin, reply_created_at) VALUES ($1, $2, $3, $4, $5)',
+                            [messageId, replyToId, replyTo.text, replyTo.isAdmin, replyTo.time]
+                        );
+                        payload.replyTo = {
+                            id: replyToId,
+                            text: replyTo.text,
+                            isAdmin: replyTo.isAdmin,
+                            time: replyTo.time
+                        };
+                    }
+                } catch (replyErr) {
+                    console.error("Error saving reply:", replyErr);
+                }
+            }
 
             io.to(sessionId).emit('message_receive', payload);
 
@@ -198,37 +219,66 @@ io.on('connection', (socket) => {
         } catch (err) { console.error(err); }
     });
 
-    // === 4. تاریخچه ===
+    // === 4. تاریخچه با اطلاعات ریپلای ===
     socket.on('get_history', async (data) => {
         const { sessionId, limit = 50 } = data || {};
         if (!sessionId || (!socket.data.isAdmin && socket.data.sessionId !== sessionId)) return;
         try {
             const res = await pool.query(
-                'SELECT * FROM p_messages WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2',
+                `SELECT m.*, 
+                json_build_object(
+                    'id', r.reply_to_id,
+                    'text', r.reply_text,
+                    'isAdmin', r.reply_is_admin,
+                    'time', r.reply_created_at
+                ) as reply_to
+                FROM p_messages m
+                LEFT JOIN message_replies r ON r.message_id = m.id
+                WHERE m.session_id = $1 
+                ORDER BY m.created_at DESC LIMIT $2`,
                 [sessionId, limit]
             );
+            
             socket.emit('history_data', res.rows.map(m => ({
-                id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text, 
-                reply_to_id: m.reply_to_id, reply_to_text: m.reply_to_text, reply_to_sender: m.reply_to_sender,
-                is_read: m.is_read, created_at: m.created_at
+                id: m.id, 
+                sessionId: m.session_id, 
+                isAdmin: m.is_admin, 
+                text: m.text, 
+                is_read: m.is_read, 
+                created_at: m.created_at,
+                replyTo: m.reply_to && m.reply_to.id ? m.reply_to : null
             })));
         } catch (err) { console.error(err); }
     });
 
-    // === 5. بارگذاری پیام‌های قدیمی‌تر ===
+    // === 5. بارگذاری پیام‌های قدیمی‌تر با اطلاعات ریپلای ===
     socket.on('get_older_history', async (data) => {
         const { sessionId, before, limit = 20 } = data || {};
         if (!sessionId || !before || (!socket.data.isAdmin && socket.data.sessionId !== sessionId)) return;
         try {
             const res = await pool.query(
-                'SELECT * FROM p_messages WHERE session_id = $1 AND created_at < $2 ORDER BY created_at DESC LIMIT $3',
+                `SELECT m.*, 
+                json_build_object(
+                    'id', r.reply_to_id,
+                    'text', r.reply_text,
+                    'isAdmin', r.reply_is_admin,
+                    'time', r.reply_created_at
+                ) as reply_to
+                FROM p_messages m
+                LEFT JOIN message_replies r ON r.message_id = m.id
+                WHERE m.session_id = $1 AND m.created_at < $2 
+                ORDER BY m.created_at DESC LIMIT $3`,
                 [sessionId, before, limit]
             );
             socket.emit('older_history_data', {
                 messages: res.rows.map(m => ({
-                    id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text,
-                    reply_to_id: m.reply_to_id, reply_to_text: m.reply_to_text, reply_to_sender: m.reply_to_sender,
-                    is_read: m.is_read, created_at: m.created_at
+                    id: m.id, 
+                    sessionId: m.session_id, 
+                    isAdmin: m.is_admin, 
+                    text: m.text, 
+                    is_read: m.is_read, 
+                    created_at: m.created_at,
+                    replyTo: m.reply_to && m.reply_to.id ? m.reply_to : null
                 }))
             });
         } catch (err) { console.error(err); }
