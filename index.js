@@ -13,8 +13,7 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// تنظیمات اتصال به دیتابیس
-// نکته: برای Render معمولاً نیاز به SSL است
+// تنظیمات دیتابیس (برای Render حتما باید SSL فعال باشد)
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false } 
@@ -50,7 +49,8 @@ async function initDB() {
             )
         `);
 
-        // *** بخش مهم: اصلاح جدول قدیمی (اضافه کردن ستون ریپلای اگر وجود ندارد) ***
+        // *** بخش تعمیر دیتابیس: اضافه کردن ستون ریپلای به جدول‌های قدیمی ***
+        // این بخش چک می‌کند اگر ستون وجود ندارد، آن را اضافه کند
         try {
             await client.query(`
                 ALTER TABLE p_messages 
@@ -59,7 +59,7 @@ async function initDB() {
             `);
             console.log("✅ Table schema updated: reply_to_id checked/added.");
         } catch (e) {
-            console.log("ℹ️ Schema update note:", e.message);
+            console.log("ℹ️ Schema check info:", e.message);
         }
         
         // 3. ایجاد جدول ری‌اکشن‌ها
