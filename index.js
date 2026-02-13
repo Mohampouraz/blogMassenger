@@ -13,20 +13,21 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
+// تنظیمات اتصال به دیتابیس
+// نکته: برای Render معمولاً نیاز به SSL است
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL
-    // نکته مهم: برای لوکال هاست، ssl را کامنت کردم چون معمولا باعث خطا می‌شود.
-    // اگر روی سرور واقعی (مثل Render) هستید، خط زیر را از کامنت در بیاورید:
-    // ssl: { rejectUnauthorized: false }
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false } 
 });
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
-// ========== دیتابیس - ایجاد جداول ==========
+// ========== دیتابیس - ایجاد و آپدیت جداول ==========
 async function initDB() {
     try {
         const client = await pool.connect();
         
+        // 1. ایجاد جدول نشست‌ها
         await client.query(`
             CREATE TABLE IF NOT EXISTS sessions (
                 id VARCHAR(100) PRIMARY KEY, 
@@ -35,6 +36,7 @@ async function initDB() {
             )
         `);
         
+        // 2. ایجاد جدول پیام‌ها
         await client.query(`
             CREATE TABLE IF NOT EXISTS p_messages (
                 id SERIAL PRIMARY KEY, 
@@ -47,7 +49,20 @@ async function initDB() {
                 FOREIGN KEY (reply_to_id) REFERENCES p_messages(id) ON DELETE SET NULL
             )
         `);
+
+        // *** بخش مهم: اصلاح جدول قدیمی (اضافه کردن ستون ریپلای اگر وجود ندارد) ***
+        try {
+            await client.query(`
+                ALTER TABLE p_messages 
+                ADD COLUMN IF NOT EXISTS reply_to_id INTEGER DEFAULT NULL 
+                REFERENCES p_messages(id) ON DELETE SET NULL
+            `);
+            console.log("✅ Table schema updated: reply_to_id checked/added.");
+        } catch (e) {
+            console.log("ℹ️ Schema update note:", e.message);
+        }
         
+        // 3. ایجاد جدول ری‌اکشن‌ها
         await client.query(`
             CREATE TABLE IF NOT EXISTS message_reactions (
                 id SERIAL PRIMARY KEY,
@@ -62,21 +77,14 @@ async function initDB() {
         `);
         
         client.release();
-        console.log("✅ Database connected successfully with reactions and replies support");
+        console.log("✅ Database connected and initialized successfully");
         
-        // سرور فقط زمانی اجرا شود که دیتابیس آماده باشد
-        const PORT = process.env.PORT || 3000;
-        server.listen(PORT, () => {
-            console.log(`🚀 Server running on port ${PORT}`);
-        });
-
     } catch (err) { 
-        console.error("❌ Database error (Check .env or Postgres running):", err); 
-        process.exit(1);
+        console.error("❌ Database initialization error:", err); 
     }
 }
 
-// اجرای دیتابیس و سپس سرور
+// اجرای دیتابیس
 initDB();
 
 // ========== میدلور احراز هویت ==========
@@ -126,6 +134,7 @@ io.use(async (socket, next) => {
 // ========== رویدادهای Socket ==========
 io.on('connection', (socket) => {
     
+    // === 1. هندلر احراز هویت ===
     const handleAuth = async () => {
         const { sessionId, isAdmin, name } = socket.data;
 
@@ -176,58 +185,112 @@ io.on('connection', (socket) => {
     };
     handleAuth();
 
+    // === 2. دریافت تاریخچه پیام‌ها ===
     socket.on('get_history', async (data) => {
         const { sessionId, limit } = data;
         const targetSession = socket.data.isAdmin ? sessionId : socket.data.sessionId;
+
         if (!targetSession) return;
+
         try {
+            // کوئری با LEFT JOIN برای گرفتن متن پیام ریپلای شده
             const res = await pool.query(
                 `SELECT 
-                    m.id, m.session_id, m.is_admin, m.text, m.reply_to_id, m.is_read, m.created_at,
-                    r.text as reply_text, r.is_admin as reply_admin
+                    m.id, 
+                    m.session_id, 
+                    m.is_admin, 
+                    m.text, 
+                    m.reply_to_id,
+                    m.is_read, 
+                    m.created_at,
+                    r.text as reply_text,
+                    r.is_admin as reply_admin
                  FROM p_messages m
                  LEFT JOIN p_messages r ON m.reply_to_id = r.id
                  WHERE m.session_id = $1 
-                 ORDER BY m.created_at DESC LIMIT $2`,
+                 ORDER BY m.created_at DESC 
+                 LIMIT $2`,
                 [targetSession, limit || 50]
             );
+
             const messages = res.rows.map(m => ({
-                id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text, replyToId: m.reply_to_id, is_read: m.is_read, created_at: m.created_at,
-                replyTo: m.reply_to_id ? { text: m.reply_text, isAdmin: m.reply_admin } : null
+                id: m.id,
+                sessionId: m.session_id,
+                isAdmin: m.is_admin,
+                text: m.text,
+                replyToId: m.reply_to_id,
+                is_read: m.is_read,
+                created_at: m.created_at,
+                replyTo: m.reply_to_id ? {
+                    text: m.reply_text,
+                    isAdmin: m.reply_admin
+                } : null
             }));
+
             socket.emit('history_data', messages);
-        } catch (err) { console.error("Error fetching history:", err); }
+        } catch (err) {
+            console.error("Error fetching history:", err);
+        }
     });
 
+    // === 3. دریافت پیام‌های قدیمی‌تر ===
     socket.on('get_older_history', async (data) => {
         const { sessionId, before, limit } = data;
         const targetSession = socket.data.isAdmin ? sessionId : socket.data.sessionId;
+
         if (!targetSession || !before) return;
+
         try {
             const res = await pool.query(
                 `SELECT 
-                    m.id, m.session_id, m.is_admin, m.text, m.reply_to_id, m.is_read, m.created_at,
-                    r.text as reply_text, r.is_admin as reply_admin
+                    m.id, 
+                    m.session_id, 
+                    m.is_admin, 
+                    m.text, 
+                    m.reply_to_id,
+                    m.is_read, 
+                    m.created_at,
+                    r.text as reply_text,
+                    r.is_admin as reply_admin
                  FROM p_messages m
                  LEFT JOIN p_messages r ON m.reply_to_id = r.id
                  WHERE m.session_id = $1 AND m.created_at < $2
-                 ORDER BY m.created_at DESC LIMIT $3`,
+                 ORDER BY m.created_at DESC 
+                 LIMIT $3`,
                 [targetSession, before, limit || 20]
             );
+
             const messages = res.rows.map(m => ({
-                id: m.id, sessionId: m.session_id, isAdmin: m.is_admin, text: m.text, replyToId: m.reply_to_id, is_read: m.is_read, created_at: m.created_at,
-                replyTo: m.reply_to_id ? { text: m.reply_text, isAdmin: m.reply_admin } : null
+                id: m.id,
+                sessionId: m.session_id,
+                isAdmin: m.is_admin,
+                text: m.text,
+                replyToId: m.reply_to_id,
+                is_read: m.is_read,
+                created_at: m.created_at,
+                replyTo: m.reply_to_id ? {
+                    text: m.reply_text,
+                    isAdmin: m.reply_admin
+                } : null
             }));
+
             socket.emit('older_history_data', { messages });
-        } catch (err) { console.error("Error fetching older history:", err); }
+        } catch (err) {
+            console.error("Error fetching older history:", err);
+        }
     });
 
+    // === 4. ارسال پیام (همراه با ریپلای) ===
     socket.on('message', async (data) => {
         const { sessionId, text, tempId, replyToId } = data;
         const isSenderAdmin = socket.data.isAdmin;
+
         if (!text || !sessionId) return;
+
         try {
-            let query, params;
+            let query;
+            let params;
+            
             if (replyToId) {
                 query = 'INSERT INTO p_messages (session_id, is_admin, text, reply_to_id) VALUES ($1, $2, $3, $4) RETURNING id, created_at';
                 params = [sessionId, isSenderAdmin, text, replyToId];
@@ -235,32 +298,131 @@ io.on('connection', (socket) => {
                 query = 'INSERT INTO p_messages (session_id, is_admin, text) VALUES ($1, $2, $3) RETURNING id, created_at';
                 params = [sessionId, isSenderAdmin, text];
             }
+            
             const res = await pool.query(query, params);
-            await pool.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [sessionId]);
 
+            await pool.query(
+                'UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', 
+                [sessionId]
+            );
+
+            // دریافت اطلاعات پیام والد برای ارسال به کلاینت
             let replyToMessage = null;
             if (replyToId) {
-                const replyRes = await pool.query('SELECT id, text, is_admin FROM p_messages WHERE id = $1', [replyToId]);
+                const replyRes = await pool.query(
+                    'SELECT id, text, is_admin FROM p_messages WHERE id = $1',
+                    [replyToId]
+                );
                 if (replyRes.rows.length > 0) {
-                    replyToMessage = { text: replyRes.rows[0].text, isAdmin: replyRes.rows[0].is_admin };
+                    replyToMessage = {
+                        text: replyRes.rows[0].text,
+                        isAdmin: replyRes.rows[0].is_admin
+                    };
                 }
             }
 
             const payload = {
-                id: res.rows[0].id, sessionId, text, isAdmin: isSenderAdmin, is_read: false, created_at: res.rows[0].created_at, tempId,
-                replyTo: replyToMessage, replyToId: replyToId
+                id: res.rows[0].id,
+                sessionId,
+                text,
+                isAdmin: isSenderAdmin,
+                is_read: false,
+                created_at: res.rows[0].created_at,
+                tempId,
+                replyTo: replyToMessage,
+                replyToId: replyToId
             };
 
             io.to(sessionId).emit('message_receive', payload);
+
             if (isSenderAdmin) {
                 socket.to('admin_room').emit('message_receive', payload);
             } else {
                 io.to('admin_room').emit('message_receive', payload);
-                io.to('admin_room').emit('list_update', { id: sessionId, name: socket.data.name, last_active: new Date(), increment_unread: true });
+                io.to('admin_room').emit('list_update', {
+                    id: sessionId,
+                    name: socket.data.name,
+                    last_active: new Date(),
+                    increment_unread: true
+                });
             }
-        } catch (err) { console.error("Error sending message:", err); }
+
+        } catch (err) {
+            console.error("Error sending message:", err);
+        }
     });
 
+    // === 5. افزودن ری‌اکشن ===
+    socket.on('add_reaction', async (data) => {
+        const { messageId, emoji } = data;
+        const { sessionId, isAdmin } = socket.data;
+        
+        if (!messageId || !emoji) return;
+        
+        try {
+            const messageCheck = await pool.query(
+                'SELECT session_id FROM p_messages WHERE id = $1',
+                [messageId]
+            );
+            if (messageCheck.rows.length === 0) return;
+            const messageSessionId = messageCheck.rows[0].session_id;
+            
+            if (!isAdmin && sessionId !== messageSessionId) return;
+            
+            await pool.query(
+                `INSERT INTO message_reactions (message_id, session_id, is_admin, emoji) 
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (message_id, session_id, emoji) DO NOTHING`,
+                [messageId, isAdmin ? `admin_${sessionId}` : sessionId, isAdmin, emoji]
+            );
+            
+            const reactionsRes = await pool.query(
+                `SELECT emoji, COUNT(*) as count, BOOL_OR(session_id = $2 AND is_admin = $3) as user_reacted
+                 FROM message_reactions WHERE message_id = $1 GROUP BY emoji`,
+                [messageId, isAdmin ? `admin_${sessionId}` : sessionId, isAdmin]
+            );
+            
+            const reactions = reactionsRes.rows.map(r => ({
+                emoji: r.emoji, count: parseInt(r.count), userReacted: r.user_reacted
+            }));
+            
+            io.to(messageSessionId).emit('reaction_update', { messageId, reactions, sessionId: messageSessionId });
+            io.to('admin_room').emit('reaction_update', { messageId, reactions, sessionId: messageSessionId });
+        } catch (err) {
+            console.error("Error adding reaction:", err);
+        }
+    });
+
+    // === 6. حذف ری‌اکشن ===
+    socket.on('remove_reaction', async (data) => {
+        const { messageId, emoji } = data;
+        const { sessionId, isAdmin } = socket.data;
+        if (!messageId || !emoji) return;
+        try {
+            const messageCheck = await pool.query('SELECT session_id FROM p_messages WHERE id = $1', [messageId]);
+            if (messageCheck.rows.length === 0) return;
+            const messageSessionId = messageCheck.rows[0].session_id;
+
+            await pool.query(
+                `DELETE FROM message_reactions WHERE message_id = $1 AND session_id = $2 AND is_admin = $3 AND emoji = $4`,
+                [messageId, isAdmin ? `admin_${sessionId}` : sessionId, isAdmin, emoji]
+            );
+
+            const reactionsRes = await pool.query(
+                `SELECT emoji, COUNT(*) as count, BOOL_OR(session_id = $2 AND is_admin = $3) as user_reacted
+                 FROM message_reactions WHERE message_id = $1 GROUP BY emoji`,
+                [messageId, isAdmin ? `admin_${sessionId}` : sessionId, isAdmin]
+            );
+            const reactions = reactionsRes.rows.map(r => ({
+                emoji: r.emoji, count: parseInt(r.count), userReacted: r.user_reacted
+            }));
+
+            io.to(messageSessionId).emit('reaction_update', { messageId, reactions, sessionId: messageSessionId });
+            io.to('admin_room').emit('reaction_update', { messageId, reactions, sessionId: messageSessionId });
+        } catch (err) { console.error("Error removing reaction:", err); }
+    });
+
+    // === 7. دیده شدن پیام ===
     socket.on('mark_seen', async ({ sessionId, viewerIsAdmin }) => {
         try {
             const targetIsAdmin = !viewerIsAdmin;
@@ -278,6 +440,7 @@ io.on('connection', (socket) => {
         } catch (err) { console.error("Error in mark_seen:", err); }
     });
 
+    // === 8. تایپینگ ===
     socket.on('typing', (data) => {
         const sessionId = data.sessionId || socket.data.sessionId;
         const isAdmin = socket.data.isAdmin;
@@ -292,12 +455,14 @@ io.on('connection', (socket) => {
         else socket.to('admin_room').emit('stop_typing', { sessionId, isAdmin: false });
     });
 
+    // === 9. قطع اتصال ===
     socket.on('disconnect', async () => {
         if (!socket.data.isAdmin && socket.data.sessionId) {
             await pool.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [socket.data.sessionId]);
         }
     });
 
+    // === 10. پیام‌های از دست رفته (سینک) ===
     socket.on('request_missed_messages', async (data) => {
          const { lastMessageId, sessionId } = data;
          if (!sessionId) return;
@@ -319,4 +484,10 @@ io.on('connection', (socket) => {
              }
          } catch (err) { console.error("Error fetching missed messages:", err); }
     });
+
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT} with DB migrations enabled`);
 });
