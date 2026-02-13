@@ -46,12 +46,21 @@ async function initDB() {
             )
         `);
 
-        // افزودن ستون reply_to_id در صورت عدم وجود (برای پشتیبانی از دیتابیس‌های قبلی)
+        // === بخش آپدیت دیتابیس (Migration) ===
+        // افزودن ستون reply_to_id (برای پشتیبانی از نسخه‌های قبلی)
         try {
-            await client.query(`ALTER TABLE p_messages ADD COLUMN reply_to_id INTEGER DEFAULT NULL`);
-            console.log("✅ Column 'reply_to_id' added to p_messages");
+            await client.query(`ALTER TABLE p_messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER DEFAULT NULL`);
+            console.log("✅ Column 'reply_to_id' check passed");
         } catch (e) {
-            // ستون احتمالا وجود دارد، نادیده می‌گیریم
+            console.log("ℹ️ Column 'reply_to_id' already exists or error checking");
+        }
+
+        // افزودن ستون reactions برای ایموجی‌ها (فرمت JSONB برای کارایی بالا)
+        try {
+            await client.query(`ALTER TABLE p_messages ADD COLUMN IF NOT EXISTS reactions JSONB DEFAULT '{}'::jsonb`);
+            console.log("✅ Column 'reactions' check passed");
+        } catch (e) {
+            console.log("ℹ️ Column 'reactions' already exists or error checking");
         }
 
         client.release();
@@ -73,6 +82,7 @@ io.use(async (socket, next) => {
         if (pass === ADMIN_PASSWORD) {
             socket.data.isAdmin = true;
             socket.data.name = "سیگار با ته‌چین ماست";
+            // برای ادمین یک شناسه موقت می‌سازیم اما در لاجیک ری‌اکشن از شناسه ثابت استفاده می‌کنیم
             socket.data.sessionId = sessionId || `admin_${Date.now()}`;
             return next();
         }
@@ -138,13 +148,13 @@ io.on('connection', (socket) => {
         try {
             // ذخیره پیام در دیتابیس به همراه reply_to_id
             const res = await pool.query(
-                'INSERT INTO p_messages (session_id, is_admin, text, reply_to_id) VALUES ($1, $2, $3, $4) RETURNING id, created_at',
-                [sessionId, isSenderAdmin, text, replyToId || null]
+                'INSERT INTO p_messages (session_id, is_admin, text, reply_to_id, reactions) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at',
+                [sessionId, isSenderAdmin, text, replyToId || null, '{}']
             );
 
             await pool.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [sessionId]);
 
-            // اگر پیامی ریپلای شده، باید متن آن را پیدا کنیم تا به کلاینت‌ها بفرستیم
+            // اگر پیامی ریپلای شده، متن والد را پیدا کنیم
             let replyData = null;
             if (replyToId) {
                 const parentMsg = await pool.query('SELECT text, is_admin FROM p_messages WHERE id = $1', [replyToId]);
@@ -165,7 +175,8 @@ io.on('connection', (socket) => {
                 is_read: false,
                 created_at: res.rows[0].created_at,
                 tempId,
-                reply_to: replyData // ارسال اطلاعات پیام والد
+                reply_to: replyData, // ارسال اطلاعات پیام والد
+                reactions: {} // آبجکت خالی ری‌اکشن برای پیام جدید
             };
 
             io.to(sessionId).emit('message_receive', payload);
@@ -187,7 +198,73 @@ io.on('connection', (socket) => {
         }
     });
 
-    // === 3. دیده شدن پیام ===
+    // === 3. ارسال ری‌اکشن (ویژگی جدید) ===
+    socket.on('send_reaction', async (data) => {
+        const { messageId, emoji } = data;
+        // اگر ادمین است، از شناسه ثابت ADMIN استفاده می‌کنیم تا با تغییر سشن ادمین، ری‌اکشن گم نشود
+        const reactorId = socket.data.isAdmin ? "ADMIN" : socket.data.sessionId;
+
+        if (!messageId || !emoji) return;
+
+        try {
+            // 1. دریافت ری‌اکشن‌های فعلی پیام و سشن مربوط به پیام
+            const res = await pool.query('SELECT reactions, session_id FROM p_messages WHERE id = $1', [messageId]);
+            
+            if (res.rows.length === 0) return;
+
+            let currentReactions = res.rows[0].reactions || {};
+            const chatSessionId = res.rows[0].session_id;
+
+            // 2. منطق Toggle (اضافه یا حذف)
+            // ساختار: { "👍": ["session_id_1", "session_id_2"], "❤️": ["ADMIN"] }
+            
+            if (!currentReactions[emoji]) {
+                currentReactions[emoji] = [];
+            }
+
+            if (currentReactions[emoji].includes(reactorId)) {
+                // اگر قبلاً ری‌اکشن داده، حذفش کن
+                currentReactions[emoji] = currentReactions[emoji].filter(id => id !== reactorId);
+                // اگر آرایه خالی شد، کل کلید را حذف کن
+                if (currentReactions[emoji].length === 0) {
+                    delete currentReactions[emoji];
+                }
+            } else {
+                // اگر ری‌اکشن نداده، اضافه کن
+                // (اختیاری: حذف سایر ری‌اکشن‌های این کاربر روی این پیام تا فقط یک ری‌اکشن داشته باشد)
+                // برای الان اجازه می‌دهیم چند ری‌اکشن داشته باشد (مثل تلگرام پرمیوم) یا می‌توانید کد زیر را فعال کنید:
+                /*
+                for (const k in currentReactions) {
+                    currentReactions[k] = currentReactions[k].filter(id => id !== reactorId);
+                    if (currentReactions[k].length === 0) delete currentReactions[k];
+                }
+                */
+                // مقداردهی مجدد چون ممکن است در حلقه بالا حذف شده باشد
+                if (!currentReactions[emoji]) currentReactions[emoji] = [];
+                currentReactions[emoji].push(reactorId);
+            }
+
+            // 3. ذخیره در دیتابیس
+            await pool.query('UPDATE p_messages SET reactions = $1 WHERE id = $2', [JSON.stringify(currentReactions), messageId]);
+
+            // 4. اطلاع‌رسانی به کلاینت‌ها
+            const updatePayload = {
+                messageId,
+                reactions: currentReactions
+            };
+
+            // ارسال به اتاق کاربری که چت متعلق به اوست
+            io.to(chatSessionId).emit('reaction_update', updatePayload);
+            
+            // ارسال به اتاق ادمین
+            io.to('admin_room').emit('reaction_update', updatePayload);
+
+        } catch (err) {
+            console.error("Error setting reaction:", err);
+        }
+    });
+
+    // === 4. دیده شدن پیام ===
     socket.on('mark_seen', async ({ sessionId, viewerIsAdmin }) => {
         try {
             const targetIsAdmin = !viewerIsAdmin;
@@ -207,12 +284,11 @@ io.on('connection', (socket) => {
         } catch (err) { console.error(err); }
     });
 
-    // === 4. تاریخچه (اصلاح شده برای Join) ===
+    // === 5. تاریخچه (شامل ری‌اکشن‌ها) ===
     socket.on('get_history', async (data) => {
         const { sessionId, limit = 50 } = data || {};
         if (!sessionId || (!socket.data.isAdmin && socket.data.sessionId !== sessionId)) return;
         try {
-            // کوئری JOIN برای گرفتن متن پیام والد
             const query = `
                 SELECT m.*, p.text as reply_text, p.is_admin as reply_admin_flag 
                 FROM p_messages m 
@@ -230,6 +306,7 @@ io.on('connection', (socket) => {
                 text: m.text, 
                 is_read: m.is_read, 
                 created_at: m.created_at,
+                reactions: m.reactions || {}, // ارسال ری‌اکشن‌ها
                 reply_to: m.reply_to_id ? {
                     id: m.reply_to_id,
                     text: m.reply_text,
@@ -239,7 +316,7 @@ io.on('connection', (socket) => {
         } catch (err) { console.error(err); }
     });
 
-    // === 5. بارگذاری پیام‌های قدیمی‌تر (اصلاح شده برای Join) ===
+    // === 6. بارگذاری پیام‌های قدیمی‌تر (شامل ری‌اکشن‌ها) ===
     socket.on('get_older_history', async (data) => {
         const { sessionId, before, limit = 20 } = data || {};
         if (!sessionId || !before || (!socket.data.isAdmin && socket.data.sessionId !== sessionId)) return;
@@ -262,6 +339,7 @@ io.on('connection', (socket) => {
                     text: m.text, 
                     is_read: m.is_read, 
                     created_at: m.created_at,
+                    reactions: m.reactions || {}, // ارسال ری‌اکشن‌ها
                     reply_to: m.reply_to_id ? {
                         id: m.reply_to_id,
                         text: m.reply_text,
@@ -272,7 +350,7 @@ io.on('connection', (socket) => {
         } catch (err) { console.error(err); }
     });
 
-    // === 6. تایپینگ ===
+    // === 7. تایپینگ ===
     socket.on('typing', (data) => {
         const sessionId = data.sessionId || socket.data.sessionId;
         const isAdmin = socket.data.isAdmin;
