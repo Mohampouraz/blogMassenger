@@ -108,6 +108,9 @@ io.on('connection', (socket) => {
             socket.join('admin_room');
             socket.join(sessionId);
             
+            // به بقیه اعلام کنیم ادمین آنلاین شد
+            socket.broadcast.emit('admin_status_change', { is_online: true });
+            
             try {
                 const users = await pool.query(`
                     SELECT s.id, s.name, s.last_active,
@@ -115,12 +118,26 @@ io.on('connection', (socket) => {
                     FROM sessions s
                     ORDER BY last_active DESC LIMIT 50
                 `);
-                socket.emit('admin_inbox', users.rows);
+                
+                // بررسی آنلاین بودن کاربران در لحظه برای لیست ادمین
+                const mappedUsers = users.rows.map(r => {
+                    const room = io.sockets.adapter.rooms.get(r.id);
+                    return {
+                        ...r,
+                        is_online: !!(room && room.size > 0)
+                    };
+                });
+                
+                socket.emit('admin_inbox', mappedUsers);
             } catch (err) {
                 console.error("Error fetching users:", err);
             }
         } else {
             socket.join(sessionId);
+            
+            // به ادمین اعلام کنیم این کاربر آنلاین شد
+            io.to('admin_room').emit('user_status_change', { id: sessionId, is_online: true, last_active: new Date() });
+            
             try {
                 await pool.query(
                     'INSERT INTO sessions (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = $2, last_active = CURRENT_TIMESTAMP',
@@ -136,6 +153,27 @@ io.on('connection', (socket) => {
         socket.emit('auth_success', { isAdmin, name, sessionId });
     };
     handleAuth();
+
+    // === درخواست وضعیت آنلاین بودن شخص مورد نظر ===
+    socket.on('check_status', async (targetId) => {
+        let isOnline = false;
+        let lastActive = null;
+
+        if (targetId === 'ADMIN') {
+            const room = io.sockets.adapter.rooms.get('admin_room');
+            isOnline = !!(room && room.size > 0);
+        } else {
+            const room = io.sockets.adapter.rooms.get(targetId);
+            isOnline = !!(room && room.size > 0);
+            if (!isOnline) {
+                try {
+                    const res = await pool.query('SELECT last_active FROM sessions WHERE id = $1', [targetId]);
+                    if (res.rows.length > 0) lastActive = res.rows[0].last_active;
+                } catch(e) {}
+            }
+        }
+        socket.emit('status_result', { targetId, isOnline, lastActive });
+    });
 
     // === 2. ارسال پیام ===
     socket.on('message', async (data) => {
@@ -189,7 +227,8 @@ io.on('connection', (socket) => {
                     id: sessionId,
                     name: socket.data.name,
                     last_active: new Date(),
-                    increment_unread: true
+                    increment_unread: true,
+                    is_online: true
                 });
             }
 
@@ -198,7 +237,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // === 3. ارسال ری‌اکشن (ویژگی جدید) ===
+    // === 3. ارسال ری‌اکشن ===
     socket.on('send_reaction', async (data) => {
         const { messageId, emoji } = data;
         // اگر ادمین است، از شناسه ثابت ADMIN استفاده می‌کنیم تا با تغییر سشن ادمین، ری‌اکشن گم نشود
@@ -214,9 +253,6 @@ io.on('connection', (socket) => {
 
             let currentReactions = res.rows[0].reactions || {};
             const chatSessionId = res.rows[0].session_id;
-
-            // 2. منطق Toggle (اضافه یا حذف)
-            // ساختار: { "👍": ["session_id_1", "session_id_2"], "❤️": ["ADMIN"] }
             
             if (!currentReactions[emoji]) {
                 currentReactions[emoji] = [];
@@ -230,16 +266,7 @@ io.on('connection', (socket) => {
                     delete currentReactions[emoji];
                 }
             } else {
-                // اگر ری‌اکشن نداده، اضافه کن
-                // (اختیاری: حذف سایر ری‌اکشن‌های این کاربر روی این پیام تا فقط یک ری‌اکشن داشته باشد)
-                // برای الان اجازه می‌دهیم چند ری‌اکشن داشته باشد (مثل تلگرام پرمیوم) یا می‌توانید کد زیر را فعال کنید:
-                /*
-                for (const k in currentReactions) {
-                    currentReactions[k] = currentReactions[k].filter(id => id !== reactorId);
-                    if (currentReactions[k].length === 0) delete currentReactions[k];
-                }
-                */
-                // مقداردهی مجدد چون ممکن است در حلقه بالا حذف شده باشد
+                // اضافه کن
                 if (!currentReactions[emoji]) currentReactions[emoji] = [];
                 currentReactions[emoji].push(reactorId);
             }
@@ -316,7 +343,7 @@ io.on('connection', (socket) => {
         } catch (err) { console.error(err); }
     });
 
-    // === 6. بارگذاری پیام‌های قدیمی‌تر (شامل ری‌اکشن‌ها) ===
+    // === 6. بارگذاری پیام‌های قدیمی‌تر ===
     socket.on('get_older_history', async (data) => {
         const { sessionId, before, limit = 20 } = data || {};
         if (!sessionId || !before || (!socket.data.isAdmin && socket.data.sessionId !== sessionId)) return;
@@ -367,7 +394,14 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', async () => {
         if (!socket.data.isAdmin && socket.data.sessionId) {
+            const now = new Date();
             await pool.query('UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE id = $1', [socket.data.sessionId]);
+            io.to('admin_room').emit('user_status_change', { id: socket.data.sessionId, is_online: false, last_active: now });
+        } else if (socket.data.isAdmin) {
+            const room = io.sockets.adapter.rooms.get('admin_room');
+            if (!room || room.size === 0) {
+                socket.broadcast.emit('admin_status_change', { is_online: false });
+            }
         }
     });
 });
