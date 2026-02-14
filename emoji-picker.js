@@ -152,6 +152,7 @@
             overflow-y: auto;
             padding: 5px;
             scroll-behavior: smooth;
+            position: relative;
         }
         .ep-grid {
             display: grid;
@@ -287,10 +288,40 @@
                 }
             });
 
-            // 3. اسکرول اسپای (برای تغییر خودکار تب هنگام اسکرول)
+            // 3. اسکرول اسپای (برای تغییر خودکار تب هنگام اسکرول) - تکمیل شده
+            const categoryTitles = body.querySelectorAll('.ep-category-title');
+            
             body.addEventListener('scroll', () => {
-                // این فیچر رو ساده نگه می‌داریم تا لگ نزند
-                // در صورت نیاز به توسعه بیشتر می‌توان اضافه کرد
+                let currentActiveCat = this.activeTab;
+
+                // پیدا کردن دسته‌بندی فعلی در محدوده دید (ViewPort)
+                categoryTitles.forEach(title => {
+                    // محاسبه فاصله با در نظر گرفتن بافر ۳۰ پیکسلی برای هدر چسبان
+                    if (title.offsetTop - 30 <= body.scrollTop) {
+                        currentActiveCat = title.id.replace('cat-', '');
+                    }
+                });
+
+                // اگر دسته‌بندی در حین اسکرول تغییر کرد، تب‌ها را آپدیت کن
+                if (currentActiveCat !== this.activeTab) {
+                    this.activeTab = currentActiveCat;
+                    
+                    // حذف کلاس active از همه تب‌ها
+                    tabs.forEach(t => t.classList.remove('active'));
+                    
+                    // اضافه کردن کلاس active به تب فعلی
+                    const activeTabEl = this.container.querySelector(`.ep-tab[data-cat="${currentActiveCat}"]`);
+                    if (activeTabEl) {
+                        activeTabEl.classList.add('active');
+                        
+                        // اسکرول خودکار نوار افقی تب‌ها تا تب فعال همیشه دیده شود
+                        activeTabEl.scrollIntoView({
+                            behavior: 'smooth',
+                            block: 'nearest',
+                            inline: 'center'
+                        });
+                    }
+                }
             });
         }
     }
