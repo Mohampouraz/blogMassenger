@@ -218,7 +218,11 @@ io.on('connection', (socket) => {
                 reply_to: replyData, reactions: {}, files: finalFiles, file_url, file_name, file_type, is_edited: false
             };
 
-            io.to(sessionId).emit('message_receive', payload);
+            // ارسال پیام به همه اعضای اتاق به جز خود فرستنده
+            socket.to(sessionId).emit('message_receive', payload);
+            
+            // ارسال به خود فرستنده با tempId
+            socket.emit('message_receive', { ...payload, isOwnMessage: true });
 
             if (isSenderAdmin) {
                 socket.to('admin_room').emit('message_receive', payload);
@@ -273,7 +277,6 @@ io.on('connection', (socket) => {
         } catch (err) { console.error("Error setting reaction:", err); }
     });
 
-    // اینجا منطق ارسال آیدی شخصِ سین کننده اضافه شد
     socket.on('mark_seen', async ({ sessionId, viewerIsAdmin }) => {
         try {
             const targetIsAdmin = !viewerIsAdmin;
