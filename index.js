@@ -11,7 +11,7 @@ const fs = require('fs');
 const app = express();
 app.use(cors());
 
-// پیکربندی آپلود فایل چندتایی (Multer)
+// پیکربندی آپلود فایل چندتایی
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir);
@@ -273,13 +273,13 @@ io.on('connection', (socket) => {
         } catch (err) { console.error("Error setting reaction:", err); }
     });
 
+    // اینجا منطق ارسال آیدی شخصِ سین کننده اضافه شد
     socket.on('mark_seen', async ({ sessionId, viewerIsAdmin }) => {
         try {
             const targetIsAdmin = !viewerIsAdmin;
-            await pool.query('UPDATE p_messages SET is_read = TRUE WHERE session_id = $1 AND is_admin = $2 AND is_read = FALSE', [sessionId, targetIsAdmin]);
-            // اضافه شدن payload برای حل تیک های اشتباه
-            io.to(sessionId).emit('msgs_seen_update', { sessionId });
-            io.to('admin_room').emit('msgs_seen_update', { sessionId });
+            const upRes = await pool.query('UPDATE p_messages SET is_read = TRUE WHERE session_id = $1 AND is_admin = $2 AND is_read = FALSE', [sessionId, targetIsAdmin]);
+            io.to(sessionId).emit('msgs_seen_update', { sessionId, readerIsAdmin: viewerIsAdmin });
+            io.to('admin_room').emit('msgs_seen_update', { sessionId, readerIsAdmin: viewerIsAdmin });
             if (viewerIsAdmin) io.to('admin_room').emit('list_update', { id: sessionId, reset_unread: true });
         } catch (err) {}
     });
