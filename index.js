@@ -47,7 +47,6 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 async function initDB() {
     try {
         const client = await pool.connect();
-        
         await client.query(`
             CREATE TABLE IF NOT EXISTS sessions (
                 id VARCHAR(100) PRIMARY KEY, 
@@ -55,7 +54,6 @@ async function initDB() {
                 last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
-
         try {
             await client.query(`
                 INSERT INTO sessions (id, name, last_active) 
@@ -75,7 +73,6 @@ async function initDB() {
             )
         `);
 
-        // Migration: افزودن ستون آرایه فایل‌ها
         const alterQueries = [
             `ALTER TABLE p_messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER DEFAULT NULL`,
             `ALTER TABLE p_messages ADD COLUMN IF NOT EXISTS reactions JSONB DEFAULT '{}'::jsonb`,
@@ -89,27 +86,22 @@ async function initDB() {
         for (let q of alterQueries) {
             try { await client.query(q); } catch (e) { } 
         }
-
         client.release();
         console.log("✅ Database structure checked and updated successfully");
     } catch (err) { console.error("❌ Database error:", err); }
 }
 initDB();
 
-// ========== مسیر آپلود فایل HTTP (اکنون پشتیبانی از آرایه) ==========
 app.post('/upload', upload.array('files', 10), (req, res) => {
     if (!req.files || req.files.length === 0) return res.status(400).send('No files uploaded.');
-    
     const fileList = req.files.map(f => ({
         url: '/uploads/' + f.filename,
         name: f.originalname,
         type: f.mimetype
     }));
-    
     res.json({ files: fileList });
 });
 
-// ========== میدلور احراز هویت ==========
 io.use(async (socket, next) => {
     const { sessionId, token, inputName } = socket.handshake.auth;
     socket.data = { sessionId: null, isAdmin: false, name: "کاربر" };
@@ -133,9 +125,7 @@ io.use(async (socket, next) => {
     next(new Error("احراز هویت ناموفق"));
 });
 
-// ========== رویدادهای Socket ==========
 io.on('connection', (socket) => {
-    
     const handleAuth = async () => {
         const { sessionId, isAdmin, name } = socket.data;
 
@@ -192,7 +182,6 @@ io.on('connection', (socket) => {
         socket.emit('status_result', { targetId, isOnline, lastActive });
     });
 
-    // === ارسال پیام با پشتیبانی از آرایه فایل‌ها ===
     socket.on('message', async (data) => {
         const { sessionId, text, tempId, replyToId, files, file_url, file_name, file_type } = data;
         const isSenderAdmin = socket.data.isAdmin;
@@ -288,8 +277,9 @@ io.on('connection', (socket) => {
         try {
             const targetIsAdmin = !viewerIsAdmin;
             await pool.query('UPDATE p_messages SET is_read = TRUE WHERE session_id = $1 AND is_admin = $2 AND is_read = FALSE', [sessionId, targetIsAdmin]);
-            io.to(sessionId).emit('msgs_seen_update');
-            io.to('admin_room').emit('msgs_seen_update');
+            // اضافه شدن payload برای حل تیک های اشتباه
+            io.to(sessionId).emit('msgs_seen_update', { sessionId });
+            io.to('admin_room').emit('msgs_seen_update', { sessionId });
             if (viewerIsAdmin) io.to('admin_room').emit('list_update', { id: sessionId, reset_unread: true });
         } catch (err) {}
     });
